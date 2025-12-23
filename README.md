@@ -13,3 +13,7 @@ pip install -r requirements.txt
 
 ## build
 pyinstaller --onefile main.py
+
+## install & run
+wget https://github.com/hasenbalg/handball_streamdeck/releases/download/init/handball_streamdeck
+./handball_streamdeck
