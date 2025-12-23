@@ -1,0 +1,4 @@
+streamdeck
+python-socketio[client]
+pillow
+pyinstaller
