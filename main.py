@@ -34,7 +34,7 @@ deck.reset()
 # ---------------------------------------------------------
 # Render text onto a Stream Deck button
 # ---------------------------------------------------------
-def render_key_image(deck, text):
+def render_key_image(deck, text, color=None, render_dot=False):
     # Create a correctly sized blank image for this deck model
     image = PILHelper.create_image(deck)
     draw = ImageDraw.Draw(image)
@@ -55,6 +55,10 @@ def render_key_image(deck, text):
     y = (image.height - h) // 2
 
     draw.text((x, y), text, font=font, fill="white")
+    if color:
+        draw.rounded_rectangle((0, 0, image.width - 6, image.height - 6), outline=color, width=3, radius=10)
+    if render_dot:
+        draw.ellipse([(image.width/2, image.height * .8), ((image.width/2)+2, (image.height * .8)+2)], width=10, fill="white")
 
     # Convert to native Stream Deck format
     return PILHelper.to_native_format(deck, image)
@@ -76,23 +80,32 @@ def key_change(deck, key, state):
             send_update({"timeout_home": True})
         elif key == 5:
             send_update({"timeout_away": True})
+        elif key == 6:
+            send_update({"side_change": True})
 
 deck.set_key_callback(key_change)
 
 # ---------------------------------------------------------
 # Set button labels
 # ---------------------------------------------------------
-deck.set_key_image(0, render_key_image(deck, "Home +1"))
-deck.set_key_image(1, render_key_image(deck, "Away +1"))
-deck.set_key_image(2, render_key_image(deck, "Timer\nStart"))
-deck.set_key_image(3, render_key_image(deck, "Timer\nStop"))
+@sio.on('state_update')
+def render_key_images(data=None):
+    home_color = data['home_color'] if data else None
+    away_color = data['away_color'] if data else None
+    running = data["running"] if data else None
+    deck.set_key_image(0, render_key_image(deck, "Home +1", home_color))
+    deck.set_key_image(1, render_key_image(deck, "Away +1", away_color))
+    deck.set_key_image(2, render_key_image(deck, "Timer\nStart", None, not running))
+    deck.set_key_image(3, render_key_image(deck, "Timer\nStop", None, running))
 
-deck.set_key_image(4, render_key_image(deck, "Home\nTimeout"))
-deck.set_key_image(5, render_key_image(deck, "Away\nTimeout"))
+    deck.set_key_image(4, render_key_image(deck, "Home\nTimeout", home_color))
+    deck.set_key_image(5, render_key_image(deck, "Away\nTimeout", away_color))
+    deck.set_key_image(6, render_key_image(deck, "Side\nChange"))
 
 # ---------------------------------------------------------
 # Keep script alive (prevents libusb crash)
 # ---------------------------------------------------------
+render_key_images(None)
 try:
     while True:
         time.sleep(1)
