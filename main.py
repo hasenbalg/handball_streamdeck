@@ -1,114 +1,185 @@
-from StreamDeck.DeviceManager import DeviceManager
-from StreamDeck.ImageHelpers import PILHelper
-from PIL import Image, ImageDraw, ImageFont
-import socketio
-import time
+"""Elgato Stream Deck controller for handball_scorebug.
+
+Connects to the scorebug's Socket.IO server, triggers actions from
+physical buttons and paints live state (team colors, running/paused
+dot, passive-armed dots) onto the keys.
+
+Key layout (keys 0-6 keep their historical positions):
+
+    0 Home +1   1 Away +1   2 Timer Start  3 Timer Stop
+    4 TO Home   5 TO Away   6 Side Change
+    7 Whistle   8 Tech TO   9 Next Period
+   10 Home -1  11 Away -1  12 Passive Home  13 Passive Away  14 Pass -1
+
+Status dots: Timer Start (clock stopped), Timer Stop / Whistle (clock
+running), Passive Home/Away (signal armed), Pass -1 (any passive on).
+"""
+
 import argparse
+import time
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--host", default="localhost")
-parser.add_argument("--port", default="80")
-args = parser.parse_args()
+# ---------------------------------------------------------------------
+# Button layout — pure data, importable without a Stream Deck attached
+# ---------------------------------------------------------------------
+# press: payload emitted on the "update" event, None = no action
+# color: "home"/"away" pulls the border color from state
+# dot:   predicate over the state dict -> white status dot
 
-url = f"http://{args.host}:{args.port}"
+BUTTONS = [
+    {"label": "Home +1",        "press": {"home_score_change": 1},  "color": "home"},
+    {"label": "Away +1",        "press": {"away_score_change": 1},  "color": "away"},
+    {"label": "Timer\nStart",   "press": {"start_timer": True},     "dot": lambda s: not s.get("running")},
+    {"label": "Timer\nStop",    "press": {"stop_timer": True},      "dot": lambda s: bool(s.get("running"))},
+    {"label": "Home\nTimeout",  "press": {"timeout_home": True},    "color": "home"},
+    {"label": "Away\nTimeout",  "press": {"timeout_away": True},    "color": "away"},
+    {"label": "Side\nChange",   "press": {"side_change": True}},
+    {"label": "Whistle\n(2:8)", "press": {"referee_whistle": True}, "dot": lambda s: bool(s.get("running"))},
+    {"label": "Technical\nTimeout", "press": {"technical_timeout": True}},
+    {"label": "Next\nPeriod",   "press": {"next_period": True}},
+    {"label": "Home −1\nundo",  "press": {"home_score_change": -1}, "color": "home"},
+    {"label": "Away −1\nundo",  "press": {"away_score_change": -1}, "color": "away"},
+    {"label": "Passive\nHome",  "press": {"passive_home": True},    "color": "home",
+     "dot": lambda s: s.get("passive_team") == "home"},
+    {"label": "Passive\nAway",  "press": {"passive_away": True},    "color": "away",
+     "dot": lambda s: s.get("passive_team") == "away"},
+    {"label": "Pass\n−1",       "press": {"passive_pass": True},
+     "dot": lambda s: s.get("passive_team") is not None},
+]
 
 
-# ---------------------------------------------------------
-# Socket.IO connection
-# ---------------------------------------------------------
-sio = socketio.Client()
-sio.connect(url)
-print(f"connected to {url}. use --host and --port for change")
+def key_visuals(state, index):
+    """(label, color, dot) for one key — doubles as its render
+    signature so unchanged keys are not re-uploaded over USB (#2)."""
+    btn = BUTTONS[index]
+    color = None
+    if btn.get("color") == "home":
+        color = state.get("home_color")
+    elif btn.get("color") == "away":
+        color = state.get("away_color")
+    dot = bool(btn["dot"](state)) if "dot" in btn else False
+    return btn["label"], color, dot
 
-def send_update(payload):
-    print(f"sending {payload}")
-    sio.emit("update", payload)
 
-# ---------------------------------------------------------
-# Stream Deck setup
-# ---------------------------------------------------------
-deck = DeviceManager().enumerate()[0]
-deck.open()
-deck.reset()
+def press_payload(index):
+    return BUTTONS[index]["press"]
 
-# ---------------------------------------------------------
-# Render text onto a Stream Deck button
-# ---------------------------------------------------------
-def render_key_image(deck, text, color=None, render_dot=False):
-    # Create a correctly sized blank image for this deck model
-    image = PILHelper.create_image(deck)
-    draw = ImageDraw.Draw(image)
+# ---------------------------------------------------------------------
+# Entry point — everything hardware/IO lives here
+# ---------------------------------------------------------------------
 
-    # Load a font
-    try:
-        font = ImageFont.truetype("arial.ttf", 18)
-    except:
-        font = ImageFont.load_default()
 
-    # Measure text
-    bbox = draw.textbbox((0, 0), text, font=font)
-    w = bbox[2] - bbox[0]
-    h = bbox[3] - bbox[1]
+def main():
+    parser = argparse.ArgumentParser(
+        description=(__doc__ or "handball_streamdeck").splitlines()[0])
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", default="80")
+    args = parser.parse_args()
 
-    # Center text
-    x = (image.width - w) // 2
-    y = (image.height - h) // 2
+    url = f"http://{args.host}:{args.port}"
 
-    draw.text((x, y), text, font=font, fill="white")
-    if color:
-        draw.rounded_rectangle((0, 0, image.width - 6, image.height - 6), outline=color, width=3, radius=10)
-    if render_dot:
-        draw.ellipse([(image.width/2, image.height * .8), ((image.width/2)+2, (image.height * .8)+2)], width=10, fill="white")
+    from StreamDeck.DeviceManager import DeviceManager
+    from StreamDeck.ImageHelpers import PILHelper
+    from PIL import Image, ImageDraw, ImageFont
+    import socketio
 
-    # Convert to native Stream Deck format
-    return PILHelper.to_native_format(deck, image)
+    # -- socket connection with retry (#3) -----------------------------
+    sio = socketio.Client(reconnection=True, reconnect_max_delay=5)
 
-# ---------------------------------------------------------
-# Button press handler
-# ---------------------------------------------------------
-def key_change(deck, key, state):
-    if state:  # key pressed
-        if key == 0:
-            send_update({"home_score_change": 1})
-        elif key == 1:
-            send_update({"away_score_change": 1})
-        elif key == 2:
-            send_update({"start_timer": True})
-        elif key == 3:
-            send_update({"stop_timer": True})
-        elif key == 4:
-            send_update({"timeout_home": True})
-        elif key == 5:
-            send_update({"timeout_away": True})
-        elif key == 6:
-            send_update({"side_change": True})
+    def connect():
+        attempt = 0
+        while not sio.connected:
+            try:
+                sio.connect(url, wait_timeout=10)
+                print(f"connected to {url} (use --host/--port to change)")
+            except Exception as e:
+                attempt += 1
+                print(f"connect failed ({e}); retry in 3 s (attempt {attempt})")
+                time.sleep(3)
 
-deck.set_key_callback(key_change)
-
-# ---------------------------------------------------------
-# Set button labels
-# ---------------------------------------------------------
-@sio.on('state_update')
-def render_key_images(data=None):
-    home_color = data['home_color'] if data else None
-    away_color = data['away_color'] if data else None
-    running = data["running"] if data else None
-    deck.set_key_image(0, render_key_image(deck, "Home +1", home_color))
-    deck.set_key_image(1, render_key_image(deck, "Away +1", away_color))
-    deck.set_key_image(2, render_key_image(deck, "Timer\nStart", None, not running))
-    deck.set_key_image(3, render_key_image(deck, "Timer\nStop", None, running))
-
-    deck.set_key_image(4, render_key_image(deck, "Home\nTimeout", home_color))
-    deck.set_key_image(5, render_key_image(deck, "Away\nTimeout", away_color))
-    deck.set_key_image(6, render_key_image(deck, "Side\nChange"))
-
-# ---------------------------------------------------------
-# Keep script alive (prevents libusb crash)
-# ---------------------------------------------------------
-render_key_images(None)
-try:
-    while True:
-        time.sleep(1)
-except KeyboardInterrupt:
+    # -- stream deck ----------------------------------------------------
+    decks = DeviceManager().enumerate()
+    if not decks:
+        raise SystemExit("no Stream Deck found")
+    deck = decks[0]
+    deck.open()
     deck.reset()
-    deck.close()
+
+    def load_font():
+        for name in ("DejaVuSans.ttf",
+                     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                     "arial.ttf"):
+            try:
+                return ImageFont.truetype(name, 18)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    font = load_font()
+
+    def render_key_image(label, color=None, render_dot=False):
+        image = PILHelper.create_image(deck)
+        draw = ImageDraw.Draw(image)
+        bbox = draw.textbbox((0, 0), label, font=font)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x = (image.width - w) // 2
+        y = (image.height - h) // 2
+        draw.text((x, y), label, font=font, fill="white")
+        if color:
+            draw.rounded_rectangle((0, 0, image.width - 6, image.height - 6),
+                                   outline=color, width=3, radius=10)
+        if render_dot:
+            r = 6
+            cx, cy = image.width // 2, int(image.height * 0.85)
+            draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill="white")
+        return PILHelper.to_native_format(deck, image)
+
+    # -- render on change only (#2) --------------------------------------
+    shown = {}
+
+    def refresh(state):
+        state = state or {}
+        for i in range(len(BUTTONS)):
+            sig = key_visuals(state, i)
+            if shown.get(i) != sig:
+                deck.set_key_image(i, render_key_image(*sig))
+                shown[i] = sig
+
+    def key_change(_deck, key, pressed):
+        if not pressed:  # key released
+            return
+        payload = press_payload(key)
+        if payload is None:
+            return
+        try:
+            print(f"sending {payload}")
+            sio.emit("update", payload)
+        except Exception as e:
+            print(f"emit failed ({e}); reconnecting")
+            connect()
+
+    deck.set_key_callback(key_change)
+
+    @sio.on("state_update")
+    def on_state(data=None):
+        refresh(data)
+
+    @sio.on("connect")
+    def on_connect():
+        refresh({})  # repaint once the link is back
+
+    connect()
+    refresh({})
+
+    # Keep the script alive (prevents libusb crash)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        deck.reset()
+        deck.close()
+
+
+if __name__ == "__main__":
+    main()
